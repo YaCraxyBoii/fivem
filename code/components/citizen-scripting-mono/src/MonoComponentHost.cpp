@@ -432,6 +432,9 @@ static void InitMono()
 	std::string citizenClrLibPath = MakeRelativeNarrowPath("citizen/clr2/lib/mono/4.5/");
 
 	putenv(const_cast<char*>(va("MONO_PATH=%s", citizenClrLibPath)));
+
+	mono_set_crash_chaining(true);
+	mono_set_signal_chaining(true);
 #endif
 
 	mono_assembly_setrootdir(citizenClrPath.c_str());
@@ -560,11 +563,21 @@ struct MonoAttachment
 
 DLL_EXPORT void MonoEnsureThreadAttached()
 {
+	if (!g_rootDomain)
+	{
+		return;
+	}
+
 	static thread_local MonoAttachment attachment;
 }
 
 result_t MonoCreateObjectInstance(const guid_t& guid, const guid_t& iid, void** objectRef)
 {
+	if (!g_rootDomain)
+	{
+		return FX_E_NOINTERFACE;
+	}
+
 	MonoEnsureThreadAttached();
 
 	MonoObject* exc = nullptr;
@@ -595,6 +608,11 @@ result_t MonoCreateObjectInstance(const guid_t& guid, const guid_t& iid, void** 
 
 std::vector<guid_t> MonoGetImplementedClasses(const guid_t& iid)
 {
+	if (!g_rootDomain)
+	{
+		return {};
+	}
+
 	MonoEnsureThreadAttached();
 
 	void* args[1];

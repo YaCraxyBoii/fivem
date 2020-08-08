@@ -302,9 +302,15 @@ static void PoolInitX(void* pool, int count)
 }
 
 static void (*g_origDrawListMgr_ClothFlush)(void*);
+static LPCRITICAL_SECTION g_clothCritSec;
 
-static void DrawListMgr_ClothFlush(char* mgr)
+static void CDrawListMgr_ClothCleanup(char* mgr)
 {
+	if (g_clothCritSec->DebugInfo)
+	{
+		EnterCriticalSection(g_clothCritSec);
+	}
+
 	atArray<void*>& refs = *(atArray<void*>*)(mgr + 1608);
 
 	for (int i = 0; i < refs.GetCount(); i++)
@@ -321,6 +327,11 @@ static void DrawListMgr_ClothFlush(char* mgr)
 	}
 
 	g_origDrawListMgr_ClothFlush(mgr);
+
+	if (g_clothCritSec->DebugInfo)
+	{
+		LeaveCriticalSection(g_clothCritSec);
+	}
 }
 
 using DeclRef = void(*)(void* removeIn, void* toRemove);
@@ -382,8 +393,39 @@ static void VehicleMetadataUnloadMagic()
 	hook::call(parserRef, VehUnloadParserHook);
 }
 
+static int GetGpuCount1()
+{
+	return 1;
+}
+
+static int GetGpuCount2(char* self)
+{
+	*(uint32_t*)(self + 56) = 1;
+	return 1;
+}
+
 static HookFunction hookFunction{[] ()
 {
+	// disable crashing on train validity check failing
+	// (this is, oddly, a cloud tunable?!)
+	hook::put<uint8_t>(hook::get_address<uint8_t*>(hook::get_pattern("44 38 3D ? ? ? ? 74 0E B1 01 E8", 3)), 0);
+
+	// mismatched NVIDIA drivers may lead to NVAPI calls (NvAPI_EnumPhysicalGPUs/NvAPI_EnumLogicalGPUs, NvAPI_D3D_GetCurrentSLIState) returning a
+	// preposterous amount of SLI GPUs. since SLI is not supported at all for Cfx (due to lack of SLI profile), just ignore GPU count provided by NVAPI/AGS.
+	{
+		auto location = hook::get_pattern("85 C0 75 22 84 DB 74 1E 40 38 3D", -0x49);
+		hook::jump(location, GetGpuCount1);
+	}
+
+	{
+		auto location = hook::get_pattern("75 32 83 A5 30 03 00 00 00 48 8D", -0x56);
+		hook::jump(location, GetGpuCount2);
+	}
+
+	// block *any* CGameWeatherEvent
+	// (hotfix)
+	hook::return_function(hook::get_pattern("45 33 C9 41 B0 01 41 8B D3 E9", -10));
+
 	// corrupt TXD store reference crash (ped decal-related?)
 	static struct : jitasm::Frontend
 	{
@@ -906,7 +948,9 @@ static HookFunction hookFunction{[] ()
 	}
 
 	// validate dlDrawListMgr cloth entries on flush
-	MH_CreateHook(hook::get_pattern("66 44 3B A9 50 06 00 00 0F 83", -0x25), DrawListMgr_ClothFlush, (void**)&g_origDrawListMgr_ClothFlush);
+	MH_CreateHook(hook::get_pattern("66 44 3B A9 50 06 00 00 0F 83", -0x25), CDrawListMgr_ClothCleanup, (void**)&g_origDrawListMgr_ClothFlush);
+
+	g_clothCritSec = hook::get_address<LPCRITICAL_SECTION>(hook::get_pattern("48 8B F8 48 89 58 10 33 C0 8D 50 10", -0x21));
 
 	// very hacky patch to not unload base game data from 'vehiclelayouts' CVehicleMetadataMgr
 	VehicleMetadataUnloadMagic();

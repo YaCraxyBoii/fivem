@@ -37,6 +37,8 @@ interface IScriptHost : fxIBase
 	void SubmitBoundaryStart(in charPtr boundaryData, in int32_t boundarySize);
 
 	void SubmitBoundaryEnd(in charPtr boundaryData, in int32_t boundarySize);
+
+	void GetLastErrorText(out charPtr errorString);
 };
 
 [uuid(9568DF2D-27C8-4B9E-B29D-48272C317084)]
@@ -110,7 +112,7 @@ interface IScriptRefRuntime : fxIBase
 [uuid(567634C6-3BDD-4D0E-AF39-7472AED479B7)]
 interface IScriptFileHandlingRuntime : fxIBase
 {
-	[notxpcom] int32_t HandlesFile(in charPtr scriptFile);
+	[notxpcom] int32_t HandlesFile(in charPtr scriptFile, in IScriptHostWithResourceData metadata);
 
 	void LoadFile(in charPtr scriptFile);
 };

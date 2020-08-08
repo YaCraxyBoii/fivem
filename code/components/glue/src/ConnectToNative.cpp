@@ -7,6 +7,7 @@
 
 #include "StdInc.h"
 
+#include <CfxLocale.h>
 #include <CefOverlay.h>
 #include <NetLibrary.h>
 #include <strsafe.h>
@@ -194,7 +195,7 @@ static void HandleAuthPayload(const std::string& payloadStr)
 {
 	if (nui::HasMainUI())
 	{
-		auto payloadJson = nlohmann::json(payloadStr).dump();
+		auto payloadJson = nlohmann::json(payloadStr).dump(-1, ' ', false, nlohmann::detail::error_handler_t::replace);
 
 		nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "authPayload", "data": %s })", payloadJson));
 	}
@@ -696,6 +697,13 @@ static InitFunction initFunction([] ()
 				}
 			}
 		}
+		else if (!_wcsicmp(type, L"setLocale"))
+		{
+			if (nui::HasMainUI())
+			{
+				CoreGetLocalization()->SetLocale(ToNarrow(arg));
+			}
+		}
 		else if (!_wcsicmp(type, L"loadSettings"))
 		{
 			loadSettings();
@@ -837,7 +845,7 @@ static InitFunction initFunction([] ()
 
 				if (!g_cardConnectionToken.empty())
 				{
-					netLibrary->SubmitCardResponse(json["data"].dump(), g_cardConnectionToken);
+					netLibrary->SubmitCardResponse(json["data"].dump(-1, ' ', false, nlohmann::detail::error_handler_t::replace), g_cardConnectionToken);
 				}
 			}
 			catch (const std::exception& e)

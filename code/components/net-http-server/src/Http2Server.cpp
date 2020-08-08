@@ -72,6 +72,16 @@ struct ZeroCopyByteBuffer
 
 			return 0;
 		}
+
+		void Advance(size_t len)
+		{
+			read += len;
+		}
+
+		size_t Leftover() const
+		{
+			return Size() - read;
+		}
 	};
 
 	template<typename TContainer>
@@ -141,7 +151,7 @@ struct ZeroCopyByteBuffer
 		return -1;
 	}
 
-	bool Take(std::string* str, std::vector<uint8_t>* vec, std::unique_ptr<char[]>* raw, size_t* rawLength, size_t* off, fu2::unique_function<void(bool)>* cb)
+	bool Take(uint32_t length, std::string* str, std::vector<uint8_t>* vec, std::unique_ptr<char[]>* raw, size_t* rawLength, size_t* off, fu2::unique_function<void(bool)>* cb)
 	{
 		if (elements.empty())
 		{
@@ -154,16 +164,58 @@ struct ZeroCopyByteBuffer
 
 			switch (elem.type)
 			{
-			case 0:
-				*str = std::move(elem.string);
-				break;
-			case 1:
-				*vec = std::move(elem.vec);
-				break;
-			case 2:
-				*raw = std::move(elem.raw);
-				*rawLength = std::move(elem.rawLength);
-				break;
+				case 0:
+				{
+					if (length < elem.Leftover())
+					{
+						*raw = std::unique_ptr<char[]>(new char[length]);
+						*rawLength = length;
+						*off = 0;
+
+						memcpy(raw->get(), elem.string.data() + elem.read, length);
+						elem.Advance(length);
+
+						return true;
+					}
+
+					*str = std::move(elem.string);
+					break;
+				}
+				case 1:
+				{
+					if (length < elem.Leftover())
+					{
+						*raw = std::unique_ptr<char[]>(new char[length]);
+						*rawLength = length;
+						*off = 0;
+
+						memcpy(raw->get(), elem.vec.data() + elem.read, length);
+						elem.Advance(length);
+
+						return true;
+					}
+
+					*vec = std::move(elem.vec);
+					break;
+				}
+				case 2:
+				{
+					if (length < elem.Leftover())
+					{
+						*raw = std::unique_ptr<char[]>(new char[length]);
+						*rawLength = length;
+						*off = 0;
+
+						memcpy(raw->get(), elem.raw.get() + elem.read, length);
+						elem.Advance(length);
+
+						return true;
+					}
+
+					*raw = std::move(elem.raw);
+					*rawLength = std::move(elem.rawLength);
+					break;
+				}
 			}
 
 			*cb = std::move(elem.cb);
@@ -224,8 +276,8 @@ namespace net
 class Http2Response : public HttpResponse
 {
 public:
-	inline Http2Response(fwRefContainer<HttpRequest> request, nghttp2_session* session, int streamID)
-		: HttpResponse(request), m_session(session), m_stream(streamID)
+	inline Http2Response(fwRefContainer<HttpRequest> request, nghttp2_session* session, int streamID, const fwRefContainer<net::TcpServerStream>& tcpStream)
+		: HttpResponse(request), m_session(session), m_stream(streamID), m_tcpStream(tcpStream)
 	{
 
 	}
@@ -247,8 +299,10 @@ public:
 			return;
 		}
 
+		auto statusCodeStr = std::to_string(statusCode);
+
 		m_headers = headers;
-		m_headers.insert({ ":status", std::to_string(statusCode) });
+		m_headers.insert({ ":status", HeaderString{ statusCodeStr.c_str(), statusCodeStr.size() } });
 
 		for (auto& header : m_headerList)
 		{
@@ -275,7 +329,7 @@ public:
 			}
 
 			*data_flags |= NGHTTP2_DATA_FLAG_NO_COPY;
-			return resp->m_buffer.PeekLength();
+			return std::min(size_t(resp->m_buffer.PeekLength()), length);
 		};
 
 		std::vector<nghttp2_nv> nv(m_headers.size());
@@ -346,11 +400,25 @@ public:
 	virtual void End() override
 	{
 		m_ended = true;
+		m_tcpStream = nullptr;
 
 		if (m_session)
 		{
 			nghttp2_session_resume_data(m_session, m_stream);
 			nghttp2_session_send(m_session);
+		}
+	}
+
+	virtual void CloseSocket() override
+	{
+		m_ended = true;
+
+		auto s = m_tcpStream;
+
+		if (s.GetRef())
+		{
+			s->Close();
+			s = {};
 		}
 	}
 
@@ -368,6 +436,7 @@ public:
 			}
 		}
 
+		m_tcpStream = nullptr;
 		m_session = nullptr;
 	}
 
@@ -384,6 +453,8 @@ private:
 	HeaderMap m_headers;
 
 	ZeroCopyByteBuffer m_buffer;
+
+	fwRefContainer<net::TcpServerStream> m_tcpStream;
 };
 
 Http2ServerImpl::Http2ServerImpl()
@@ -418,7 +489,7 @@ void Http2ServerImpl::OnConnection(fwRefContainer<TcpServerStream> stream)
 	{
 		HttpConnectionData* connection;
 
-		std::map<std::string, std::string> headers;
+		HeaderMap headers;
 
 		std::vector<uint8_t> body;
 
@@ -459,21 +530,46 @@ void Http2ServerImpl::OnConnection(fwRefContainer<TcpServerStream> stream)
 			size_t off;
 			fu2::unique_function<void(bool)> cb;
 
-			if (buf.Take(&s, &v, &raw, &rawLength, &off, &cb))
+			if (buf.Take(length, &s, &v, &raw, &rawLength, &off, &cb))
 			{
-				assert(off == 0);
+				if (off == 0)
+				{
+					if (!s.empty())
+					{
+						data->stream->Write(std::move(s), std::move(cb));
+					}
+					else if (!v.empty())
+					{
+						data->stream->Write(std::move(v), std::move(cb));
+					}
+					else if (raw)
+					{
+						data->stream->Write(std::move(raw), rawLength, std::move(cb));
+					}
+				}
+				else
+				{
+					if (!s.empty())
+					{
+						auto d = std::unique_ptr<char[]>(new char[length]);
+						memcpy(d.get(), s.data() + off, length);
 
-				if (!s.empty())
-				{
-					data->stream->Write(std::move(s), std::move(cb));
-				}
-				else if (!v.empty())
-				{
-					data->stream->Write(std::move(v), std::move(cb));
-				}
-				else if (raw)
-				{
-					data->stream->Write(std::move(raw), rawLength, std::move(cb));
+						data->stream->Write(std::move(d), length, std::move(cb));
+					}
+					else if (!v.empty())
+					{
+						auto d = std::unique_ptr<char[]>(new char[length]);
+						memcpy(d.get(), v.data() + off, length);
+
+						data->stream->Write(std::move(d), length, std::move(cb));
+					}
+					else if (raw)
+					{
+						auto d = std::unique_ptr<char[]>(new char[length]);
+						memcpy(d.get(), raw.get() + off, length);
+
+						data->stream->Write(std::move(d), length, std::move(cb));
+					}
 				}
 			}
 
@@ -560,6 +656,8 @@ void Http2ServerImpl::OnConnection(fwRefContainer<TcpServerStream> stream)
 				if (req)
 				{
 					HeaderMap headerList;
+					HeaderString method;
+					HeaderString path;
 
 					for (auto& header : req->headers)
 					{
@@ -571,11 +669,19 @@ void Http2ServerImpl::OnConnection(fwRefContainer<TcpServerStream> stream)
 						{
 							headerList.emplace("host", header.second);
 						}
+						else if (header.first == ":method")
+						{
+							method = header.second;
+						}
+						else if (header.first == ":path")
+						{
+							path = header.second;
+						}
 					}
 
-					fwRefContainer<HttpRequest> request = new HttpRequest(2, 0, req->headers[":method"], req->headers[":path"], headerList, req->connection->stream->GetPeerAddress().ToString());
+					fwRefContainer<HttpRequest> request = new HttpRequest(2, 0, method, path, headerList, req->connection->stream->GetPeerAddress());
 					
-					fwRefContainer<HttpResponse> response = new Http2Response(request, session, frame->hd.stream_id);
+					fwRefContainer<HttpResponse> response = new Http2Response(request, session, frame->hd.stream_id, req->connection->stream);
 					req->connection->responses.push_back(response);
 
 					req->httpResp = response;

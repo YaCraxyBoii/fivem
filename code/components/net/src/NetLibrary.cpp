@@ -619,7 +619,7 @@ void NetLibrary::RunFrame()
 			break;
 
 		case CS_CONNECTING:
-			if ((GetTickCount() - m_lastConnect) > 5000)
+			if ((GetTickCount() - m_lastConnect) > 5000 && m_impl->IsDisconnected())
 			{
 				m_impl->SendConnect(fmt::sprintf("token=%s&guid=%llu", m_token, (uint64_t)GetGUID()));
 
@@ -1120,6 +1120,7 @@ concurrency::task<void> NetLibrary::ConnectToServer(const std::string& rootUrl)
 #endif
 
 				auto bitVersion = (!node["bitVersion"].is_null() ? node["bitVersion"].get<uint64_t>() : 0);
+				auto rawEndpoints = (node.find("endpoints") != node.end()) ? node["endpoints"] : nlohmann::json{};
 
 				auto continueAfterEndpoints = [=, capNode = node](const nlohmann::json& capEndpointsJson)
 				{
@@ -1139,15 +1140,22 @@ concurrency::task<void> NetLibrary::ConnectToServer(const std::string& rootUrl)
 								endpoints.push_back(endpoint.get<std::string>());
 							}
 						}
+						else if (!rawEndpoints.is_null() && rawEndpoints.is_array() && !rawEndpoints.empty())
+						{
+							for (const auto& endpoint : rawEndpoints)
+							{
+								endpoints.push_back(endpoint.get<std::string>());
+							}
+						}
 
 						if (endpoints.empty())
 						{
 							auto uri = skyr::make_url(url);
 							std::string endpoint;
 
-							if (!uri->port().empty())
+							if (uri->port<int>())
 							{
-								endpoint = fmt::sprintf("%s:%d", uri->hostname(), uri->port<int>());
+								endpoint = fmt::sprintf("%s:%d", uri->hostname(), *uri->port<int>());
 							}
 							else
 							{
@@ -1191,7 +1199,7 @@ concurrency::task<void> NetLibrary::ConnectToServer(const std::string& rootUrl)
 							}
 						});
 
-						Instance<ICoreGameInit>::Get()->SetData("handoverBlob", (!node["handover"].is_null()) ? node["handover"].dump() : "{}");
+						Instance<ICoreGameInit>::Get()->SetData("handoverBlob", (!node["handover"].is_null()) ? node["handover"].dump(-1, ' ', false, nlohmann::detail::error_handler_t::replace) : "{}");
 
 						Instance<ICoreGameInit>::Get()->EnhancedHostSupport = (!node["enhancedHostSupport"].is_null() && node.value("enhancedHostSupport", false));
 						Instance<ICoreGameInit>::Get()->OneSyncEnabled = (!node["onesync"].is_null() && node["onesync"].get<bool>());
@@ -1380,8 +1388,6 @@ concurrency::task<void> NetLibrary::ConnectToServer(const std::string& rootUrl)
 						m_connectionState = CS_IDLE;
 					}
 				};
-
-				auto rawEndpoints = (node.find("endpoints") != node.end()) ? node["endpoints"] : nlohmann::json{};
 
 				if (bitVersion >= 0x202004201223)
 				{

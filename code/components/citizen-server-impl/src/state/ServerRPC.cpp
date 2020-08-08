@@ -35,9 +35,9 @@ tbb::concurrent_unordered_map<uint32_t, fx::EntityCreationState> g_entityCreatio
 static std::minstd_rand g_creationToken;
 static std::linear_congruential_engine<uint32_t, 12820163, 0, (1 << 24) - 1> g_objectToken;
 
-inline uint32_t MakeEntityHandle(uint8_t playerId, uint16_t objectId)
+inline uint32_t MakeEntityHandle(uint16_t objectId)
 {
-	return ((playerId + 1) << 16) | objectId;
+	return objectId;
 }
 
 namespace fx
@@ -83,7 +83,7 @@ static InitFunction initFunction([]()
 		gameState->OnEntityCreate.Connect([](std::shared_ptr<fx::sync::SyncEntityState> entity)
 		{
 			auto creationToken = entity->creationToken;
-			auto objectId = entity->handle & 0xFFFF;
+			auto objectId = entity->handle;
 
 			auto it = g_entityCreationList.find(creationToken);
 
@@ -94,7 +94,7 @@ static InitFunction initFunction([]()
 				if (guid && guid->type == fx::ScriptGuid::Type::TempEntity)
 				{
 					guid->type = fx::ScriptGuid::Type::Entity;
-					guid->entity.handle = MakeEntityHandle(0, objectId);
+					guid->entity.handle = MakeEntityHandle(objectId);
 				}
 
 				g_entityCreationList[creationToken] = {};
@@ -130,6 +130,7 @@ static InitFunction initFunction([]()
 				uint32_t delId = 0;
 				int clientIdx = -1;
 				uint32_t contextId = 0;
+				std::shared_ptr<fx::sync::SyncEntityState> entity;
 
 				if (native->GetRpcType() == RpcConfiguration::RpcType::EntityContext)
 				{
@@ -172,11 +173,20 @@ static InitFunction initFunction([]()
 							if (scriptGuid->type == fx::ScriptGuid::Type::Entity)
 							{
 								// look up the entity owner
-								auto entity = gameState->GetEntity(cxtEntity);
+								entity = gameState->GetEntity(cxtEntity);
 
 								if (entity)
 								{
-									clientIdx = entity->client.lock()->GetNetId();
+									auto client = entity->client.lock();
+
+									if (client)
+									{
+										clientIdx = client->GetNetId();
+									}
+									else
+									{
+										clientIdx = -2;
+									}
 								}
 							}
 							else if (scriptGuid->type == fx::ScriptGuid::Type::TempEntity)
@@ -457,7 +467,18 @@ static InitFunction initFunction([]()
 					cl->SendPacket(0, buffer, NetPacketType_ReliableReplayed);
 				};
 
-				if (clientIdx == -1)
+				if (clientIdx == -2)
+				{
+					if (entity && !entity->client.lock())
+					{
+						std::unique_lock<std::shared_mutex> _(entity->guidMutex);
+						entity->onCreationRPC.push_back([buffer](const std::shared_ptr<fx::Client>& client)
+						{
+							client->SendPacket(0, buffer, NetPacketType_ReliableReplayed);
+						});
+					}
+				}
+				else if (clientIdx == -1)
 				{
 					clientRegistry->ForAllClients(sendToClient);
 				}

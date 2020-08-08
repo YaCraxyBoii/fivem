@@ -10,6 +10,11 @@
 #include <ScriptSerialization.h>
 #include <MakePlayerEntityFunction.h>
 
+namespace fx
+{
+void DisownEntityScript(const std::shared_ptr<sync::SyncEntityState>& entity);
+}
+
 static InitFunction initFunction([]()
 {
 	auto makeEntityFunction = [](auto fn, uintptr_t defaultValue = 0)
@@ -213,7 +218,7 @@ static InitFunction initFunction([]()
 				auto m4 = glm::toMat4(glm::quat{qw, qx, qy, qz});
 
 				// common GTA rotation (2) is ZXY
-				glm::extractEulerAngleZXY(m4, resultVec.x, resultVec.y, resultVec.z);
+				glm::extractEulerAngleZXY(m4, resultVec.z, resultVec.x, resultVec.y);
 
 				resultVec.x = glm::degrees(resultVec.x);
 				resultVec.y = glm::degrees(resultVec.y);
@@ -253,7 +258,7 @@ static InitFunction initFunction([]()
 				auto m4 = glm::toMat4(glm::quat{ qw, qx, qy, qz });
 
 				float _, z;
-				glm::extractEulerAngleZXY(m4, _, _, z);
+				glm::extractEulerAngleZXY(m4, z, _, _);
 
 				heading = glm::degrees(z);
 #endif
@@ -897,6 +902,45 @@ static InitFunction initFunction([]()
 
 		return 0;
 	}));
+
+	fx::ScriptEngine::RegisterNativeHandler("SET_ENTITY_AS_NO_LONGER_NEEDED", [](fx::ScriptContext& context)
+	{
+		// get the current resource manager
+		auto resourceManager = fx::ResourceManager::GetCurrent();
+
+		// get the owning server instance
+		auto instance = resourceManager->GetComponent<fx::ServerInstanceBaseRef>()->Get();
+
+		// get the server's game state
+		auto gameState = instance->GetComponent<fx::ServerGameState>();
+
+		// parse the client ID
+		auto id = context.CheckArgument<uint32_t*>(0);
+
+		if (!*id)
+		{
+			return;
+		}
+
+		auto entity = gameState->GetEntity(*id);
+
+		if (!entity)
+		{
+			throw std::runtime_error(va("Tried to access invalid entity: %d", *id));
+			return;
+		}
+
+		if (entity->client.lock())
+		{
+			// TODO: client-side set-as-no-longer-needed indicator
+		}
+		else
+		{
+			fx::DisownEntityScript(entity);
+		}
+
+		*id = 0;
+	});
 
 	fx::ScriptEngine::RegisterNativeHandler("GET_SELECTED_PED_WEAPON", makeEntityFunction([](fx::ScriptContext& context, const std::shared_ptr<fx::sync::SyncEntityState>& entity)
 	{

@@ -19,8 +19,11 @@
 #include <mmsystem.h>
 #include <dsound.h>
 #include <ScriptEngine.h>
+#include <scrEngine.h>
 
 #include <CoreConsole.h>
+
+#include <sysAllocator.h>
 
 #include <NetworkPlayerMgr.h>
 #include <netObject.h>
@@ -165,6 +168,8 @@ static struct
 	volatile int nextConnectDelay;
 	volatile uint64_t nextConnectAt;
 
+	boost::optional<net::PeerAddress> overridePeer;
+
 	concurrency::concurrent_queue<std::function<void()>> mainFrameExecQueue;
 } g_mumble;
 
@@ -175,7 +180,7 @@ static void Mumble_Connect()
 
 	_initVoiceChatConfig();
 
-	g_mumbleClient->ConnectAsync(g_netLibrary->GetCurrentPeer(), fmt::sprintf("[%d] %s", g_netLibrary->GetServerNetID(), g_netLibrary->GetPlayerName())).then([](concurrency::task<MumbleConnectionInfo*> task)
+	g_mumbleClient->ConnectAsync(g_mumble.overridePeer ? *g_mumble.overridePeer : g_netLibrary->GetCurrentPeer(), fmt::sprintf("[%d] %s", g_netLibrary->GetServerNetID(), g_netLibrary->GetPlayerName())).then([](concurrency::task<MumbleConnectionInfo*> task)
 	{
 		try
 		{
@@ -202,7 +207,7 @@ static void Mumble_Connect()
 	});
 }
 
-static void Mumble_Disconnect()
+static void Mumble_Disconnect(bool reconnect = false)
 {
 	g_mumble.connected = false;
 	g_mumble.errored = false;
@@ -211,6 +216,10 @@ static void Mumble_Disconnect()
 
 	g_mumbleClient->DisconnectAsync().then([=]()
 	{
+		if (reconnect)
+		{
+			Mumble_Connect();
+		}
 	});
 
 	_initVoiceChatConfig();
@@ -435,13 +444,14 @@ static void Mumble_RunFrame()
 
 		curOutDevice = outDevice;
 	}
+
+	g_mumbleClient->RunFrame();
 }
 
 static std::bitset<256> g_talkers;
 static std::bitset<256> o_talkers;
 
 static std::unordered_map<std::string, int> g_userNamesToClientIds;
-static std::regex g_usernameRe("^\\[(0-9+)\\] ");
 
 static auto PositionHook(const std::string& userName) -> std::optional<std::array<float, 3>>
 {
@@ -449,29 +459,32 @@ static auto PositionHook(const std::string& userName) -> std::optional<std::arra
 
 	if (it == g_userNamesToClientIds.end())
 	{
-		std::smatch matches;
-
-		if (std::regex_match(userName, matches, g_usernameRe))
+		if (userName.length() >= 2)
 		{
-			int serverId = std::stoi(matches[1].str());
+			int serverId = atoi(userName.substr(1, userName.length() - 1).c_str());
 
-			static auto getByServerId = fx::ScriptEngine::GetNativeHandler(HashString("GET_PLAYER_FROM_SERVER_ID"));
-
-			it = g_userNamesToClientIds.insert({ userName, FxNativeInvoke::Invoke<int>(getByServerId, serverId) }).first;
+			it = g_userNamesToClientIds.insert({ userName, serverId }).first;
 		}
 	}
 
 	if (it != g_userNamesToClientIds.end())
 	{
-		static auto getPlayerPed = fx::ScriptEngine::GetNativeHandler(HashString("GET_PLAYER_PED"));
-		static auto getEntityCoords = fx::ScriptEngine::GetNativeHandler(HashString("GET_ENTITY_COORDS"));
+		rage::sysMemAllocator::UpdateAllocatorValue();
 
-		int ped = FxNativeInvoke::Invoke<int>(getPlayerPed, it->second);
+		static auto getByServerId = fx::ScriptEngine::GetNativeHandler(HashString("GET_PLAYER_FROM_SERVER_ID"));
+		static auto getPlayerPed = fx::ScriptEngine::GetNativeHandler(0x43A66C31C68491C0);
 
-		if (ped > 0)
+		auto playerId = FxNativeInvoke::Invoke<uint32_t>(getByServerId, it->second);
+
+		if (playerId < 256 && playerId != -1)
 		{
-			auto coords = FxNativeInvoke::Invoke<scrVector>(getEntityCoords, ped);
-			return { { coords.x, coords.y, coords.z } };
+			int ped = FxNativeInvoke::Invoke<int>(getPlayerPed, playerId);
+
+			if (ped > 0)
+			{
+				auto coords = NativeInvoke::Invoke<0x3FEF770D40960D5A, scrVector>(ped);
+				return { { coords.x, coords.z, coords.y } };
+			}
 		}
 	}
 
@@ -498,6 +511,7 @@ static HookFunction initFunction([]()
 	OnKillNetworkDone.Connect([]()
 	{
 		g_mumbleClient->SetAudioDistance(0.0f);
+		g_mumble.overridePeer = {};
 
 		Mumble_Disconnect();
 		o_talkers.reset();
@@ -830,6 +844,31 @@ static HookFunction hookFunction([]()
 			}
 
 			context.SetResult<int>(channelId);
+		});
+
+		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_IS_CONNECTED", [](fx::ScriptContext& context)
+		{
+			context.SetResult<bool>(g_mumble.connected ? true : false);
+		});
+		
+		
+		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_SET_SERVER_ADDRESS", [](fx::ScriptContext& context)
+		{
+			auto address = context.GetArgument<const char*>(0);
+			int port = context.GetArgument<int>(1);
+
+			boost::optional<net::PeerAddress> overridePeer = net::PeerAddress::FromString(fmt::sprintf("%s:%d", address, port), port);
+
+			if (overridePeer)
+			{
+				g_mumble.overridePeer = overridePeer;
+
+				Mumble_Disconnect(true);
+			}
+			else
+			{
+				throw std::exception("Couldn't resolve Mumble server address.");
+			}
 		});
 
 		scrBindGlobal("GET_AUDIOCONTEXT_FOR_CLIENT", getAudioContext);

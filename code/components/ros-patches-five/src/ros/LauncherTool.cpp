@@ -163,7 +163,7 @@ static void Steam_Run(const boost::program_options::variables_map& map)
 
 #include <wincrypt.h>
 
-static DWORD WINAPI CertGetNameStringStub(_In_ PCCERT_CONTEXT pCertContext, _In_ DWORD dwType, _In_ DWORD dwFlags, _In_opt_ void *pvTypePara, _Out_writes_to_opt_(cchNameString, return) LPWSTR pszNameString, _In_ DWORD cchNameString)
+static DWORD WINAPI CertGetNameStringStubW(_In_ PCCERT_CONTEXT pCertContext, _In_ DWORD dwType, _In_ DWORD dwFlags, _In_opt_ void *pvTypePara, _Out_writes_to_opt_(cchNameString, return) LPWSTR pszNameString, _In_ DWORD cchNameString)
 {
 	DWORD origSize = CertGetNameStringW(pCertContext, dwType, dwFlags, pvTypePara, nullptr, 0);
 	std::vector<wchar_t> data(origSize);
@@ -180,13 +180,43 @@ static DWORD WINAPI CertGetNameStringStub(_In_ PCCERT_CONTEXT pCertContext, _In_
 	{
 		return CertGetNameStringW(pCertContext, dwType, dwFlags, pvTypePara, pszNameString, cchNameString);
 	}
-	
+
 	if (pszNameString)
 	{
 		wcsncpy(pszNameString, newName, cchNameString);
 	}
 
 	return wcslen(newName) + 1;
+}
+
+static DWORD WINAPI CertGetNameStringStubA(_In_ PCCERT_CONTEXT pCertContext, _In_ DWORD dwType, _In_ DWORD dwFlags, _In_opt_ void* pvTypePara, _Out_writes_to_opt_(cchNameString, return) LPSTR pszNameString, _In_ DWORD cchNameString)
+{
+	DWORD origSize = CertGetNameStringA(pCertContext, dwType, dwFlags, pvTypePara, nullptr, 0);
+	std::vector<char> data(origSize);
+
+	CertGetNameStringA(pCertContext, dwType, dwFlags, pvTypePara, data.data(), origSize);
+
+	// get which name to replace
+	const char* newName = nullptr;
+
+	auto certString = std::string{ data.data() };
+	if (certString == "DigiCert SHA2 Assured ID Code Signing CA")
+	{
+		newName = "Entrust Code Signing CA - OVCS1";
+	}
+
+	// return if no such name
+	if (newName == nullptr)
+	{
+		return CertGetNameStringA(pCertContext, dwType, dwFlags, pvTypePara, pszNameString, cchNameString);
+	}
+
+	if (pszNameString)
+	{
+		strncpy(pszNameString, newName, cchNameString);
+	}
+
+	return strlen(newName) + 1;
 }
 
 static HWND g_launcherWindow;
@@ -233,7 +263,7 @@ static HWND WINAPI CreateWindowExWStub(_In_     DWORD     dwExStyle,
 	}
 
 	auto hWnd = g_origCreateWindowExW(dwExStyle, lpClassName, lpWindowName, dwStyle, x, y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
-	 
+
 	if (isThing)
 	{
 		// set up a lazy wait for closing the window
@@ -378,6 +408,31 @@ static int ReturnFalse()
 	return 0;
 }
 
+static BOOL ShellExecuteExWStub(_Inout_ SHELLEXECUTEINFOW *pExecInfo)
+{
+	if (pExecInfo->lpFile && wcsstr(pExecInfo->lpFile, L"RockstarService"))
+	{
+		return ShellExecuteExW(pExecInfo);
+	}
+
+	if (pExecInfo->lpFile)
+	{
+		trace("Restricting MTL ShellExecuteExW: %s\n", ToNarrow(pExecInfo->lpFile));
+	}
+
+	return TRUE;
+}
+
+HINSTANCE ShellExecuteWStub(_In_opt_ HWND hwnd, _In_opt_ LPCWSTR lpOperation, _In_ LPCWSTR lpFile, _In_opt_ LPCWSTR lpParameters, _In_opt_ LPCWSTR lpDirectory, _In_ INT nShowCmd)
+{
+	if (lpFile)
+	{
+		trace("Restricting MTL ShellExecuteW: %s\n", ToNarrow(lpFile));
+	}
+
+	return NULL;
+}
+
 HANDLE CreateNamedPipeAHookL(_In_ LPCSTR lpName, _In_ DWORD dwOpenMode, _In_ DWORD dwPipeMode, _In_ DWORD nMaxInstances, _In_ DWORD nOutBufferSize, _In_ DWORD nInBufferSize, _In_ DWORD nDefaultTimeOut, _In_opt_ LPSECURITY_ATTRIBUTES lpSecurityAttributes);
 
 static void Launcher_Run(const boost::program_options::variables_map& map)
@@ -443,9 +498,13 @@ static void Launcher_Run(const boost::program_options::variables_map& map)
 		hook::iat("kernel32.dll", CreateMutexWStub, "CreateMutexW");
 		hook::iat("kernel32.dll", CreateNamedPipeAHookL, "CreateNamedPipeA");
 
+		hook::iat("shell32.dll", ShellExecuteExWStub, "ShellExecuteExW");
+		hook::iat("shell32.dll", ShellExecuteWStub, "ShellExecuteW");
+
 		DoLauncherUiSkip();
 
-		hook::iat("crypt32.dll", CertGetNameStringStub, "CertGetNameStringW");
+		hook::iat("crypt32.dll", CertGetNameStringStubW, "CertGetNameStringW");
+		hook::iat("crypt32.dll", CertGetNameStringStubA, "CertGetNameStringA");
 		hook::iat("wintrust.dll", WinVerifyTrustStub, "WinVerifyTrust");
 
 		hook::iat("kernel32.dll", GetProcAddressStub, "GetProcAddress");

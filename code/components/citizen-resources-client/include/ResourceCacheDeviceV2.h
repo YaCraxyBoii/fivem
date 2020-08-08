@@ -1,6 +1,7 @@
 #pragma once
 
 #include <tbb/concurrent_unordered_map.h>
+#include <concurrent_queue.h>
 
 #include <optional>
 
@@ -51,7 +52,8 @@ protected:
 
 	virtual void CloseFile() = 0;
 
-	virtual bool EnsureRead();
+public:
+	virtual bool EnsureRead(const std::function<void(bool, const std::string&)>& cb = {});
 
 protected:
 	RcdFetcher* m_fetcher;
@@ -207,5 +209,7 @@ protected:
 	std::string m_pathPrefix;
 
 	std::string m_lastError;
+
+	concurrency::concurrent_queue<THandle> m_handleDeleteQueue;
 };
 }

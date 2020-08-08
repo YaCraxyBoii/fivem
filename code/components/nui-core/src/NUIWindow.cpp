@@ -396,7 +396,7 @@ void NUIWindow::Initialize(CefString url)
 	CefString(&settings.default_encoding).FromString("utf-8");
 
 	CefRefPtr<CefRequestContext> rc = CefRequestContext::GetGlobalContext();
-	CefBrowserHost::CreateBrowser(info, m_client, url, settings, rc);
+	CefBrowserHost::CreateBrowser(info, m_client, url, settings, {}, rc);
 
 	if (!info.shared_texture_enabled)
 	{
@@ -432,13 +432,8 @@ void NUIWindow::UpdateSharedResource(void* sharedHandle, uint64_t syncKey, const
 	m_syncKey = syncKey;
 	
 	{
-		if (m_lastParentHandle[type] != parentHandle)
+		if (sharedHandle != m_lastParentHandle[type])
 		{
-			if (type == CefRenderHandler::PaintElementType::PET_VIEW)
-			{
-				trace("Changing NUI shared resource (for NUI window %s)...\n", m_name);
-			}
-
 			m_lastParentHandle[type] = parentHandle;
 
 			auto& texRef = (type == CefRenderHandler::PaintElementType::PET_VIEW) ? m_nuiTexture : m_popupTexture;
@@ -471,7 +466,16 @@ void NUIWindow::UpdateSharedResource(void* sharedHandle, uint64_t syncKey, const
 					ID3D11Device* rawDevice;
 				}*deviceStuff = (decltype(deviceStuff))g_nuiGi->GetD3D11Device();
 
-				deviceStuff->rawDevice->CreateShaderResourceView((ID3D11Resource*)GetParentTexture(CefRenderHandler::PaintElementType::PET_VIEW)->GetNativeTexture(), nullptr, &m_swapSrv);
+				auto nativeTexture = GetParentTexture(CefRenderHandler::PaintElementType::PET_VIEW)->GetNativeTexture();
+
+				if (nativeTexture)
+				{
+					deviceStuff->rawDevice->CreateShaderResourceView((ID3D11Resource*)nativeTexture, nullptr, &m_swapSrv);
+				}
+				else
+				{
+					m_swapSrv = {};
+				}
 
 				if (oldSrv)
 				{
@@ -616,7 +620,7 @@ void NUIWindow::UpdateFrame()
 			argList->SetSize(1);
 			argList->SetString(0, item);
 
-			browser->SendProcessMessage(PID_RENDERER, message);
+			browser->GetMainFrame()->SendProcessMessage(PID_RENDERER, message);
 		}
 	}
 

@@ -37,7 +37,7 @@ bool NUIApp::GetLocalizedString(int messageID, CefString& string)
 void NUIApp::OnContextInitialized()
 {
 	auto manager = CefCookieManager::GetGlobalManager(nullptr);
-	manager->SetSupportedSchemes({ "nui" }, nullptr);
+	manager->SetSupportedSchemes({ "nui" }, true, nullptr);
 }
 
 void NUIApp::OnContextCreated(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefRefPtr<CefV8Context> context)
@@ -103,13 +103,18 @@ void NUIApp::OnBeforeCommandLineProcessing(const CefString& process_type, CefRef
 	command_line->AppendSwitch("use-fake-ui-for-media-stream");
 	command_line->AppendSwitch("enable-speech-input");
 	command_line->AppendSwitch("ignore-gpu-blacklist");
+	command_line->AppendSwitch("ignore-gpu-blocklist"); // future proofing for when Google disables the above
 	command_line->AppendSwitch("enable-usermedia-screen-capture");
 	command_line->AppendSwitch("disable-direct-composition");
+	command_line->AppendSwitch("disable-gpu-driver-bug-workarounds");
 	command_line->AppendSwitchWithValue("default-encoding", "utf-8");
 	//command_line->AppendSwitch("disable-gpu-vsync");
 	command_line->AppendSwitchWithValue("autoplay-policy", "no-user-gesture-required");
 	command_line->AppendSwitch("force-gpu-rasterization");
 	command_line->AppendSwitch("disable-gpu-process-crash-limit");
+
+	// important switch to prevent users from mentioning 'why are there 50 chromes again'
+	command_line->AppendSwitch("disable-site-isolation-trials");
 
 	// some GPUs are in the GPU blacklist as 'forcing D3D9'
 	// this just forces D3D11 anyway.
@@ -123,7 +128,7 @@ void NUIApp::OnBeforeCommandLineProcessing(const CefString& process_type, CefRef
 	command_line->AppendSwitchWithValue("register-pepper-plugins", fmt::sprintf("%s;application/x-cfx-game-view", ToNarrow(MakeRelativeCitPath(L"bin\\d3d_rendering.dll"))));
 }
 
-bool NUIApp::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefProcessId source_process, CefRefPtr<CefProcessMessage> message)
+bool NUIApp::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefProcessId source_process, CefRefPtr<CefProcessMessage> message)
 {
 	auto handler = m_processMessageHandlers.find(message->GetName());
 	bool success = false;

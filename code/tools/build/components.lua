@@ -282,7 +282,7 @@ local do_component = function(name, comp)
 	links { "Shared", "fmtlib" }
 
 	-- HACKHACK: premake doesn't allow unsetting these
-	if name ~= 'adhesive' and name ~= 'legacy-game-re3' then
+	if name ~= 'adhesive' and name ~= 'legacy-game-re3' and name ~= 'fxdk-main' then
 		pchsource "client/common/StdInc.cpp"
 		pchheader "StdInc.h"
 	end
@@ -306,6 +306,8 @@ local do_component = function(name, comp)
 			includedirs { 'components/' .. dep .. '/include/' }
 		end
 	end
+
+	_G._ROOTPATH = path.getabsolute('.')
 
 	configuration {}
 	local postCb = dofile(comp.absPath .. '/component.lua')

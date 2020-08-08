@@ -42,6 +42,7 @@
 	"nui:profiles",
 	"citizen:scripting:core",
 	"citizen:scripting:lua",
+	"citizen:scripting:lua54",
 	"citizen:scripting:v8",
 	"scripting:gta",
 	"citizen:resources:client",
@@ -59,5 +60,6 @@
 	"citizen:mod-loader:five",
 	"adhesive",
 	"citizen:game:ipc",
-	"legacy-game:re3"
+	"legacy-game:re3",
+	"fxdk:main"
 ]

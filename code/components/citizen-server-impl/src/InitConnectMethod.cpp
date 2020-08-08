@@ -57,8 +57,13 @@ void RegisterServerIdentityProvider(ServerIdentityProviderBase* provider)
 	g_providersByType.insert({ provider->GetIdentifierPrefix(), provider });
 }
 
+extern bool IsOneSync();
 extern bool IsLengthHack();
 }
+
+static std::mutex g_ticketMapMutex;
+static std::unordered_set<std::tuple<uint64_t, uint64_t>> g_ticketList;
+static std::chrono::milliseconds g_nextTicketGc;
 
 static bool VerifyTicket(const std::string& guid, const std::string& ticket)
 {
@@ -86,14 +91,10 @@ static bool VerifyTicket(const std::string& guid, const std::string& ticket)
 	std::time_t timeVal;
 	std::time(&timeVal);
 
-	std::tm* tm = std::gmtime(&timeVal);
-
-	std::time_t utcTime = std::mktime(tm);
-
 	// verify
-	if (ticketExpiry < utcTime)
+	if (ticketExpiry < timeVal)
 	{
-		trace("Connecting player: ticket expired\n");
+		console::DPrintf("server", "Connecting player: ticket expired\n");
 		return false;
 	}
 
@@ -102,8 +103,25 @@ static bool VerifyTicket(const std::string& guid, const std::string& ticket)
 
 	if (realGuid != ticketGuid)
 	{
-		trace("Connecting player: ticket GUID not matching\n");
+		console::DPrintf("server", "Connecting player: ticket GUID not matching\n");
 		return false;
+	}
+
+	{
+		std::unique_lock<std::mutex> _(g_ticketMapMutex);
+
+		if (g_ticketList.find({ ticketExpiry, ticketGuid }) != g_ticketList.end())
+		{
+			return false;
+		}
+
+		if (msec() > g_nextTicketGc)
+		{
+			g_ticketList.clear();
+			g_nextTicketGc = msec() + std::chrono::minutes(30);
+		}
+
+		g_ticketList.insert({ ticketExpiry, ticketGuid });
 	}
 
 	// check the RSA signature
@@ -139,7 +157,7 @@ static bool VerifyTicket(const std::string& guid, const std::string& ticket)
 
 	if (!valid)
 	{
-		trace("Connecting player: ticket RSA signature not matching\n");
+		console::DPrintf("server", "Connecting player: ticket RSA signature not matching\n");
 		return false;
 	}
 
@@ -211,7 +229,7 @@ static std::optional<TicketData> VerifyTicketEx(const std::string& ticket)
 
 	if (!valid)
 	{
-		trace("Connecting player: ticket RSA signature not matching\n");
+		console::DPrintf("server", "Connecting player: ticket RSA signature not matching\n");
 		return {};
 	}
 
@@ -379,6 +397,15 @@ static InitFunction initFunction([]()
 				return;
 			}
 
+			if (fx::IsOneSync())
+			{
+				if (protocol < 9)
+				{
+					sendError("Client/server version mismatch.");
+					return;
+				}
+			}
+
 			// verify game name
 			bool validGameName = false;
 			std::string intendedGameName;
@@ -457,10 +484,10 @@ static InitFunction initFunction([]()
 
 			json data = json::object();
 			data["protocol"] = 5;
-			data["bitVersion"] = 0x202006140932;
+			data["bitVersion"] = 0x202007151853;
 			data["sH"] = shVar->GetValue();
-			data["enhancedHostSupport"] = ehVar->GetValue() && !g_oneSyncVar->GetValue();
-			data["onesync"] = g_oneSyncVar->GetValue();
+			data["enhancedHostSupport"] = ehVar->GetValue() && !fx::IsOneSync();
+			data["onesync"] = fx::IsOneSync();
 			data["onesync_big"] = fx::IsBigMode();
 			data["onesync_lh"] = fx::IsLengthHack();
 			data["token"] = token;

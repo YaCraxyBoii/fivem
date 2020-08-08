@@ -1776,6 +1776,35 @@ static uint32_t GetFireApplicability(void* event, void* pos)
 	return (1 << 31);
 }
 
+static hook::thiscall_stub<bool(void* eventMgr, bool fatal)> rage__netEventMgr__CheckForSpaceInPool([]()
+{
+	return hook::get_pattern("41 C1 E0 02 41 C1 F8 02 41 2B C0 0F 85", -0x2A);
+});
+
+static void (*g_origSendAlterWantedLevelEvent1)(void*, void*, void*, void*);
+
+static void SendAlterWantedLevelEvent1Hook(void* a1, void* a2, void* a3, void* a4)
+{
+	if (!rage__netEventMgr__CheckForSpaceInPool(g_netEventMgr, false))
+	{
+		return;
+	}
+
+	g_origSendAlterWantedLevelEvent1(a1, a2, a3, a4);
+}
+
+static void (*g_origSendAlterWantedLevelEvent2)(void*, void*, void*, void*);
+
+static void SendAlterWantedLevelEvent2Hook(void* a1, void* a2, void* a3, void* a4)
+{
+	if (!rage__netEventMgr__CheckForSpaceInPool(g_netEventMgr, false))
+	{
+		return;
+	}
+
+	g_origSendAlterWantedLevelEvent2(a1, a2, a3, a4);
+}
+
 static HookFunction hookFunctionEv([]()
 {
 	MH_Initialize();
@@ -1793,6 +1822,10 @@ static HookFunction hookFunctionEv([]()
 
 	// fire applicability
 	MH_CreateHook(hook::get_pattern("85 DB 74 78 44 8B F3 48", -0x30), GetFireApplicability, (void**)&g_origGetFireApplicability);
+
+	// CAlterWantedLevelEvent pool check
+	MH_CreateHook(hook::get_call(hook::get_pattern("45 8A C6 48 8B C8 8B D5 E8 ? ? ? ? 45 32 E4", 8)), SendAlterWantedLevelEvent1Hook, (void**)&g_origSendAlterWantedLevelEvent1);
+	MH_CreateHook(hook::get_pattern("4C 8B 78 10 48 85 ED 74 74 66 39 55", -0x58), SendAlterWantedLevelEvent2Hook, (void**)&g_origSendAlterWantedLevelEvent2);
 
 	MH_EnableHook(MH_ALL_HOOKS);
 
@@ -2235,19 +2268,22 @@ static HookFunction hookFunctionTime([]()
 	});
 });
 
+template<typename TIndex>
 struct WorldGridEntry
 {
 	uint8_t sectorX;
 	uint8_t sectorY;
-	uint8_t slotID;
+	TIndex slotID;
 };
 
+template<typename TIndex, int TCount>
 struct WorldGridState
 {
-	WorldGridEntry entries[12];
+	WorldGridEntry<TIndex> entries[TCount];
 };
 
-static WorldGridState g_worldGrid[256];
+static WorldGridState<uint8_t, 12> g_worldGrid[256];
+static WorldGridState<uint16_t, 32> g_worldGrid2[1];
 
 static InitFunction initFunctionWorldGrid([]()
 {
@@ -2266,6 +2302,20 @@ static InitFunction initFunctionWorldGrid([]()
 
 			buf.Read(reinterpret_cast<char*>(g_worldGrid) + base, length);
 		});
+
+		lib->AddReliableHandler("msgWorldGrid3", [](const char* data, size_t len)
+		{
+			net::Buffer buf(reinterpret_cast<const uint8_t*>(data), len);
+			auto base = buf.Read<uint32_t>();
+			auto length = buf.Read<uint32_t>();
+
+			if ((size_t(base) + length) > sizeof(g_worldGrid2))
+			{
+				return;
+			}
+
+			buf.Read(reinterpret_cast<char*>(g_worldGrid2) + base, length);
+		});
 	});
 });
 
@@ -2278,23 +2328,46 @@ bool DoesLocalPlayerOwnWorldGrid(float* pos)
 		return g_origDoesLocalPlayerOwnWorldGrid(pos);
 	}
 
-	auto playerIdx = g_playerMgr->localPlayer->physicalPlayerIndex;
-
-	int sectorX = std::max(pos[0] + 8192.0f, 0.0f) / 75;
-	int sectorY = std::max(pos[1] + 8192.0f, 0.0f) / 75;
-
-	bool does = false;
-
-	for (const auto& entry : g_worldGrid[playerIdx].entries)
+	if (icgi->NetProtoVersion < 0x202007021121)
 	{
-		if (entry.sectorX == sectorX && entry.sectorY == sectorY && entry.slotID == playerIdx)
-		{
-			does = true;
-			break;
-		}
-	}
+		int sectorX = std::max(pos[0] + 8192.0f, 0.0f) / 75;
+		int sectorY = std::max(pos[1] + 8192.0f, 0.0f) / 75;
 
-	return does;
+		auto playerIdx = g_playerMgr->localPlayer->physicalPlayerIndex;
+
+		bool does = false;
+
+		for (const auto& entry : g_worldGrid[playerIdx].entries)
+		{
+			if (entry.sectorX == sectorX && entry.sectorY == sectorY && entry.slotID == playerIdx)
+			{
+				does = true;
+				break;
+			}
+		}
+
+		return does;
+	}
+	else
+	{
+		int sectorX = std::max(pos[0] + 8192.0f, 0.0f) / 150;
+		int sectorY = std::max(pos[1] + 8192.0f, 0.0f) / 150;
+
+		auto playerIdx = g_netIdsByPlayer[g_playerMgr->localPlayer];
+
+		bool does = false;
+
+		for (const auto& entry : g_worldGrid2[0].entries)
+		{
+			if (entry.sectorX == sectorX && entry.sectorY == sectorY && entry.slotID == playerIdx)
+			{
+				does = true;
+				break;
+			}
+		}
+
+		return does;
+	}
 }
 
 static int GetScriptParticipantIndexForPlayer(CNetGamePlayer* player)
@@ -2304,6 +2377,11 @@ static int GetScriptParticipantIndexForPlayer(CNetGamePlayer* player)
 
 static HookFunction hookFunctionWorldGrid([]()
 {
+	auto p = hook::pattern("BE 01 00 00 00 8B E8 85 C0 0F 84").count(1);
+	hook::jump(p.get(0).get<void>(-0x4D), DoesLocalPlayerOwnWorldGrid);
+	
+	hook::jump(hook::get_pattern("BE 01 00 00 00 45 33 C9 40 88 74 24 20", -0x2D), DoesLocalPlayerOwnWorldGrid);
+
 	MH_Initialize();
 	MH_CreateHook(hook::get_pattern("44 8A 40 2D 41", -0x1B), DoesLocalPlayerOwnWorldGrid, (void**)&g_origDoesLocalPlayerOwnWorldGrid);
 	MH_EnableHook(MH_ALL_HOOKS);

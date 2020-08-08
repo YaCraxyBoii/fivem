@@ -23,7 +23,7 @@ param (
     $Identity = "C:\guava_deploy.ppk"
 )
 
-$CefName = "cef_binary_73.0.0-cef-patchset.1936+ga086e57+chromium-73.0.3683.75_windows64_minimal"
+$CefName = "cef_binary_83.0.0-shared-textures.2175+g5430a8e+chromium-83.0.4103.0_windows64_hf1_minimal"
 
 # from http://stackoverflow.com/questions/2124753/how-i-can-use-powershell-with-the-visual-studio-command-prompt
 function Invoke-BatchFile
@@ -68,6 +68,7 @@ function Invoke-WebHook
     iwr -UseBasicParsing -Uri $env:DISCORD_WEBHOOK -Method POST -Headers @{'Content-Type' = 'application/json'} -Body (ConvertTo-Json -Compress -InputObject $payload) | out-null
 }
 
+$UseNewCI = $false
 $inCI = $false
 $Triggerer = "$env:USERDOMAIN\$env:USERNAME"
 $UploadBranch = "canary"
@@ -224,10 +225,10 @@ if (!$DontBuild)
         Write-Host "[downloading chrome]" -ForegroundColor DarkMagenta
         try {
             if (!(Test-Path "$SaveDir\$CefName.zip")) {
-                Invoke-WebRequest -UseBasicParsing -OutFile "$SaveDir\$CefName.zip" "https://runtime.fivem.net/build/cef/$CefName.zip"
+                curl.exe -Lo "$SaveDir\$CefName.zip" "https://runtime.fivem.net/build/cef/$CefName.zip"
             }
 
-            Expand-Archive -Force -Path "$SaveDir\$CefName.zip" -DestinationPath $WorkDir\vendor\cef
+			tar.exe -C $WorkDir\vendor\cef -xf "$SaveDir\$CefName.zip"
             Move-Item -Force $WorkDir\vendor\cef\$CefName\* $WorkDir\vendor\cef\
             Remove-Item -Recurse $WorkDir\vendor\cef\$CefName\
         } catch {
@@ -248,15 +249,21 @@ if (!$DontBuild)
 
 	if (!($env:APPVEYOR)) {
 	    Push-Location $WorkDir\..\
+	    
+	    $CIBranch = "master-old"
+	    
+	    if (!$IsServer -and !$IsRDR -and $UseNewCI) {
+			$CIBranch = "master"
+	    }
 
 	    # cloned, building
 	    if (!(Test-Path fivem-private)) {
-	        git clone -b master-old $env:FIVEM_PRIVATE_URI
+	        git clone -b $CIBranch $env:FIVEM_PRIVATE_URI
 	    } else {
 	        cd fivem-private
 
 	        git fetch origin | Out-Null
-	        git reset --hard origin/master-old | Out-Null
+	        git reset --hard origin/$CIBranch | Out-Null
 
 	        cd ..
 	    }
@@ -301,7 +308,7 @@ if (!$DontBuild)
 
     #echo $env:Path
     #/logger:C:\f\customlogger.dll /noconsolelogger
-    msbuild /p:preferredtoolarchitecture=x64 /p:configuration=release /v:q /fl /m:4 $BuildPath\CitizenMP.sln
+    msbuild /p:preferredtoolarchitecture=x64 /p:configuration=release /fl /m:4 $BuildPath\CitizenMP.sln
 
     if (!$?) {
         Invoke-WebHook "Building Cfx/$GameName failed :("
@@ -482,7 +489,7 @@ if (!$DontBuild -and !$IsServer) {
     "$GameVersion" | Out-File -Encoding ascii $CacheDir\fivereborn\citizen\version.txt
     "${env:CI_PIPELINE_ID}" | Out-File -Encoding ascii $CacheDir\fivereborn\citizen\release.txt
 
-    if (!$IsLauncher) {
+    if ($IsRDR -or !$UseNewCI) {
         if (Test-Path $CacheDir\fivereborn\adhesive.dll) {
             Remove-Item -Force $CacheDir\fivereborn\adhesive.dll
         }
@@ -495,7 +502,15 @@ if (!$DontBuild -and !$IsServer) {
             .\BuildComplianceInfo.exe $CacheDir\fivereborn\ C:\f\bci-list.txt
             Pop-Location
         }
-    }
+    } 
+    
+	if (!$IsLauncher) {
+		if (($env:COMPUTERNAME -eq "AVALON") -or ($env:COMPUTERNAME -eq "OMNITRON")) {
+			Push-Location C:\f\bci\
+			.\BuildComplianceInfo.exe $CacheDir\fivereborn\ C:\f\bci-list.txt
+			Pop-Location
+		}
+	}
 
     # build meta/xz variants
     "<Caches>

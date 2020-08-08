@@ -162,7 +162,7 @@ void NUIClient::OnAfterCreated(CefRefPtr<CefBrowser> browser)
 	OnClientCreated(this);
 }
 
-bool NUIClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefProcessId source_process, CefRefPtr<CefProcessMessage> message)
+bool NUIClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefProcessId source_process, CefRefPtr<CefProcessMessage> message)
 {
 	auto handler = m_processMessageHandlers.find(message->GetName());
 	bool success = false;
@@ -280,6 +280,7 @@ void NUIClient::OnAudioCategoryConfigure(const std::string& frame, const std::st
 	}
 }
 
+#if 0
 void NUIClient::OnAudioStreamStarted(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, int audio_stream_id, int channels, ChannelLayout channel_layout, int sample_rate, int frames_per_buffer)
 {
 	if (g_audioSink)
@@ -350,6 +351,7 @@ void NUIClient::OnAudioStreamStopped(CefRefPtr<CefBrowser> browser, CefRefPtr<Ce
 
 	m_audioStreams.erase({ browser->GetIdentifier(), audio_stream_id });
 }
+#endif
 
 extern bool g_shouldCreateRootWindow;
 
@@ -402,14 +404,6 @@ CefRefPtr<CefLoadHandler> NUIClient::GetLoadHandler()
 CefRefPtr<CefRequestHandler> NUIClient::GetRequestHandler()
 {
 	return this;
-}
-
-CefRefPtr<CefAudioHandler> NUIClient::GetAudioHandler()
-{
-	// #TODONUI: render process termination does not work this way, needs an owning reference to the browser
-	// or otherwise tracking why the browser doesn't become null when playing audio and killing the render process
-	return nullptr;
-	//return this;
 }
 
 CefRefPtr<CefRenderHandler> NUIClient::GetRenderHandler()

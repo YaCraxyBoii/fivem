@@ -32,6 +32,9 @@ namespace CitizenFX.Core
 
 		[MethodImpl(MethodImplOptions.InternalCall)]
 		void SubmitBoundaryEnd([In] [MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 1)] byte[] boundaryData, int boundarySize);
+
+		[MethodImpl(MethodImplOptions.InternalCall)]
+		IntPtr GetLastErrorText();
 	}
 
 	[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -41,6 +44,12 @@ namespace CitizenFX.Core
 	{
 		[MethodImpl(MethodImplOptions.InternalCall)]
 		void GetResourceName(out IntPtr nameString);
+
+		[MethodImpl(MethodImplOptions.InternalCall)]
+		void GetNumResourceMetaData([MarshalAs(UnmanagedType.LPStr)] string fieldName, out IntPtr numFields);
+
+		[MethodImpl(MethodImplOptions.InternalCall)]
+		void GetResourceMetaData([MarshalAs(UnmanagedType.LPStr)] string fieldName, out IntPtr fieldValue);
 	}
 
 	[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]

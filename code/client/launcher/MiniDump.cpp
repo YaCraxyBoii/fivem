@@ -16,6 +16,7 @@
 #include <client/windows/crash_generation/crash_generation_server.h>
 #include <common/windows/http_upload.h>
 
+#include <CfxLocale.h>
 #include <CfxState.h>
 #include <CfxSubProcess.h>
 #include <HostSharedData.h>
@@ -72,7 +73,7 @@ static void send_sentry_session(const json& data)
 	std::stringstream bodyData;
 	bodyData << "{}\n";
 	bodyData << R"({"type":"session"})" << "\n";
-	bodyData << data.dump() << "\n";
+	bodyData << data.dump(-1, ' ', false, nlohmann::detail::error_handler_t::replace) << "\n";
 
 	auto r = cpr::Post(
 	cpr::Url{ "https://sentry.fivem.net/api/2/envelope/" },
@@ -102,7 +103,7 @@ static void UpdateSession(json& session)
 
 	if (f)
 	{
-		auto s = session.dump();
+		auto s = session.dump(-1, ' ', false, nlohmann::detail::error_handler_t::replace);
 		fwrite(s.data(), 1, s.size(), f);
 		fclose(f);
 	}
@@ -335,10 +336,12 @@ static void OverloadCrashData(TASKDIALOGCONFIG* config)
 				errData.errorDescription = "";
 			}
 
-			static std::wstring errTitle = fmt::sprintf(L"RAGE error: %s", ToWide(errData.errorName));
-			static std::wstring errDescription = fmt::sprintf(L"A game error (at %016llx) caused " PRODUCT_NAME L" to stop working. "
-				L"A crash report has been uploaded to the " PRODUCT_NAME L" developers.\n\n%s",
+			static std::wstring errTitle = fmt::sprintf(gettext(L"RAGE error: %s"), ToWide(errData.errorName));
+			static std::wstring errDescription = fmt::sprintf(gettext(L"A game error (at %016llx) caused %s to stop working. "
+				L"A crash report has been uploaded to the %s developers.\n\n%s"),
 				retAddr,
+				PRODUCT_NAME,
+				PRODUCT_NAME,
 				ToWide(ParseLinks(errData.errorDescription)));
 
 			config->pszMainInstruction = errTitle.c_str();
@@ -398,7 +401,7 @@ static void OverloadCrashData(TASKDIALOGCONFIG* config)
 	if (blame)
 	{
 		static std::wstring errTitle = fmt::sprintf(L"%s encountered an error", blame);
-		static std::wstring errDescription = fmt::sprintf(L"FiveM crashed due to %s.\n%s\n\nIf you require immediate support, please visit <A HREF=\"https://forum.fivem.net/\">FiveM.net</A> and mention the details in this window.", blame, blame_two);
+		static std::wstring errDescription = fmt::sprintf(L"FiveM crashed due to %s.\n%s", blame, blame_two);
 
 		config->pszMainInstruction = errTitle.c_str();
 		config->pszContent = errDescription.c_str();
@@ -426,7 +429,7 @@ static std::wstring GetAdditionalData()
 
 			add_crashometry(jsonData);
 
-			return ToWide(jsonData.dump());
+			return ToWide(jsonData.dump(-1, ' ', false, nlohmann::detail::error_handler_t::replace));
 		}
 	}
 
@@ -442,7 +445,7 @@ static std::wstring GetAdditionalData()
 
 			add_crashometry(error_pickup);
 
-			return ToWide(error_pickup.dump());
+			return ToWide(error_pickup.dump(-1, ' ', false, nlohmann::detail::error_handler_t::replace));
 		}
 	}
 
@@ -460,7 +463,7 @@ static std::wstring GetAdditionalData()
 			data["what"] = exWhat;
 		}
 
-		return ToWide(data.dump());;
+		return ToWide(data.dump(-1, ' ', false, nlohmann::detail::error_handler_t::replace));
 	}
 }
 
@@ -887,6 +890,9 @@ static LPTHREAD_START_ROUTINE GetFunc(HANDLE hProcess, const char* name)
 	return (LPTHREAD_START_ROUTINE)((char*)modules[0] + off);
 }
 
+extern nlohmann::json SymbolicateCrash(HANDLE hProcess, HANDLE hThread, PEXCEPTION_RECORD er, PCONTEXT ctx);
+extern void ParseSymbolicCrash(nlohmann::json& crash, std::string* signature, std::string* stackTrace);
+
 void InitializeDumpServer(int inheritedHandle, int parentPid)
 {
 	static bool g_running = true;
@@ -906,6 +912,8 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 	{
 		auto process_handle = info->process_handle();
 		DWORD exceptionCode = 0;
+
+		json symCrash;
 
 		{
 			EXCEPTION_POINTERS* ei;
@@ -936,6 +944,17 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 
 					if (valid)
 					{
+						DWORD thread;
+						if (info->GetClientThreadId(&thread))
+						{
+							auto th = OpenThread(THREAD_ALL_ACCESS, FALSE, thread);
+
+							if (th)
+							{
+								symCrash = SymbolicateCrash(process_handle, th, &ex, &cx);
+							}
+						}
+
 						DWORD processLen = 0;
 						if (EnumProcessModules(process_handle, nullptr, 0, &processLen))
 						{
@@ -1145,9 +1164,24 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 
 		if (GetProcessId(parentProcess) != GetProcessId(info->process_handle()))
 		{
+			wchar_t imageName[MAX_PATH];
+			GetProcessImageFileNameW(info->process_handle(), imageName, std::size(imageName));
+
+			if (wcsstr(imageName, L"GameRuntime") != nullptr)
+			{
+				shouldTerminate = false;
+			}
+
 			if (crashHash.find(L"libcef") != std::string::npos)
 			{
 				shouldTerminate = false;
+			}
+
+			// NVIDIA crashes in Chrome GPU process
+			if (crashHash.find(L"nvwgf2") != std::string::npos)
+			{
+				shouldTerminate = false;
+				shouldUpload = false;
 			}
 
 			// Chrome OOM situations (kOomExceptionCode)
@@ -1162,18 +1196,30 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 		static std::wstring mainInstruction = PRODUCT_NAME L" has stopped working";
 		
 		std::wstring cuz = L"An error";
+		std::string stackTrace;
+		std::string csignature;
+
+		if (!symCrash.is_null())
+		{
+			ParseSymbolicCrash(symCrash, &csignature, &stackTrace);
+		}
 
 		if (!crashHash.empty())
 		{
 			auto ch = UnblameCrash(crashHash);
 
+			if (!csignature.empty())
+			{
+				ch = ToWide(csignature);
+			}
+
 			if (crashHash.find(L".exe") != std::string::npos)
 			{
-				windowTitle = fmt::sprintf(L"Error %s", ch);
+				windowTitle = fmt::sprintf(gettext(L"Error %s"), ch);
 			}
 
 			mainInstruction = fmt::sprintf(L"%s", ch);
-			cuz = fmt::sprintf(L"An error at %s", ch);
+			cuz = fmt::sprintf(gettext(L"An error at %s"), ch);
 
 			json crashData = load_json_file(L"citizen/crash-data.json");
 
@@ -1183,7 +1229,7 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 
 				if (!cd.empty())
 				{
-					mainInstruction = L"FiveM crashed... but we're on it!";
+					mainInstruction = gettext(L"FiveM crashed... but we're on it!");
 					cd += "\n\n";
 				}
 
@@ -1198,21 +1244,26 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 			cuz = ToWide(fmt::sprintf("An unhandled exception (of type %s)", exType));
 		}
 
-		static std::wstring content = fmt::sprintf(L"%s caused " PRODUCT_NAME L" to stop working. A crash report is being uploaded to the " PRODUCT_NAME L" developers.", cuz);
+		static std::wstring content = fmt::sprintf(gettext(L"%s caused %s to stop working. A crash report is being uploaded to the %s developers."), cuz, PRODUCT_NAME, PRODUCT_NAME);
 
 		if (!exWhat.empty())
 		{
-			content += fmt::sprintf(L"\n\nException details: %s", ToWide(exWhat));
+			content += fmt::sprintf(gettext(L"\n\nException details: %s"), ToWide(exWhat));
 		}
 
 		if (!crashHash.empty() && crashHash.find(L".exe") != std::string::npos)
 		{
-			content += fmt::sprintf(L"\n\nLegacy crash hash: %s", HashCrash(crashHash));
+			content += fmt::sprintf(gettext(L"\n\nLegacy crash hash: %s"), HashCrash(crashHash));
+		}
+
+		if (!stackTrace.empty())
+		{
+			content += fmt::sprintf(gettext(L"\nStack trace:\n%s"), ToWide(stackTrace));
 		}
 
 		if (shouldTerminate)
 		{
-			std::thread([]()
+			std::thread([csignature]()
 			{
 				static HostSharedData<CfxState> hostData("CfxInitState");
 				HANDLE gameProcess = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION, FALSE, hostData->gamePid);
@@ -1226,12 +1277,17 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 				{
 					std::string friendlyReason = ToNarrow(HashCrash(crashHash) + L" (" + UnblameCrash(crashHash) + L")");
 
-					if (!exType.empty())
+					if (!csignature.empty())
 					{
-						friendlyReason = "Unhandled exception: " + exType;
+						friendlyReason = csignature;
 					}
 
-					friendlyReason = "Game crashed: " + friendlyReason;
+					if (!exType.empty())
+					{
+						friendlyReason = gettext("Unhandled exception: ") + exType;
+					}
+
+					friendlyReason = gettext("Game crashed: ") + friendlyReason;
 
 					LPVOID memPtr = VirtualAllocEx(gameProcess, NULL, friendlyReason.size() + 1, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 
@@ -1260,18 +1316,20 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 		static std::optional<std::wstring> crashId;
 		static std::optional<std::wstring> crashIdError;
 
+		static auto saveStr = gettext(L"Save information\nStores a file with crash information that you should copy and upload when asking for help.");
+
 		static const TASKDIALOG_BUTTON buttons[] = {
-			{ 42, L"Save information\nStores a file with crash information that you should copy and upload when asking for help." }
+			{ 42, saveStr.c_str() }
 		};
 
-		static std::wstring tempSignature = fmt::sprintf(L"Crash signature: %s\nReport ID: ... [uploading]\nYou can press Ctrl-C to copy this message and paste it elsewhere.", crashHash);
+		static std::wstring tempSignature = fmt::sprintf(gettext(L"Crash signature: %s\nReport ID: ... [uploading]\nYou can press Ctrl-C to copy this message and paste it elsewhere."), crashHash);
 
 		if (crashometry.find("kill_network_msg") != crashometry.end() && crashometry.find("reload_game") == crashometry.end())
 		{
 			windowTitle = L"Disconnected";
 			mainInstruction = L"O\x448\x438\x431\x43A\x430 (Error)";
 
-			content = ToWide(crashometry["kill_network_msg"]) + L"\n\nThis is a fatal error because game unloading failed. Please report this issue and how to cause it (what server you played on, any resources/scripts, etc.) so this can be solved.";
+			content = ToWide(crashometry["kill_network_msg"]) + gettext(L"\n\nThis is a fatal error because game unloading failed. Please report this issue and how to cause it (what server you played on, any resources/scripts, etc.) so this can be solved.");
 		}
 
 		static std::thread saveThread;
@@ -1323,11 +1381,11 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 				{
 					if (!crashId->empty())
 					{
-						SendMessage(hWnd, TDM_SET_ELEMENT_TEXT, TDE_EXPANDED_INFORMATION, (WPARAM)va(L"Crash signature: %s\nReport ID: %s\nYou can press Ctrl-C to copy this message and paste it elsewhere.", crashHash.c_str(), crashId->c_str()));
+						SendMessage(hWnd, TDM_SET_ELEMENT_TEXT, TDE_EXPANDED_INFORMATION, (WPARAM)va(gettext(L"Crash signature: %s\nReport ID: %s\nYou can press Ctrl-C to copy this message and paste it elsewhere."), crashHash.c_str(), crashId->c_str()));
 					}
 					else if (crashIdError && !crashIdError->empty())
 					{
-						SendMessage(hWnd, TDM_SET_ELEMENT_TEXT, TDE_EXPANDED_INFORMATION, (WPARAM)va(L"Crash signature: %s\n%s\nYou can press Ctrl-C to copy this message and paste it elsewhere.", crashHash.c_str(), crashIdError->c_str()));
+						SendMessage(hWnd, TDM_SET_ELEMENT_TEXT, TDE_EXPANDED_INFORMATION, (WPARAM)va(gettext(L"Crash signature: %s\n%s\nYou can press Ctrl-C to copy this message and paste it elsewhere."), crashHash.c_str(), crashIdError->c_str()));
 					}
 
 					SendMessage(hWnd, TDM_ENABLE_BUTTON, IDCLOSE, 1);
@@ -1395,7 +1453,7 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 #ifdef GTA_NY
 		if (HTTPUpload::SendRequest(L"http://cr.citizen.re:5100/submit", parameters, files, nullptr, &responseBody, &responseCode))
 #elif defined(GTA_FIVE)
-		if (uploadCrashes && shouldUpload && HTTPUpload::SendRequest(L"https://crash-ingress.fivem.net/post", parameters, files, &timeout, &responseBody, &responseCode))
+		if (uploadCrashes && shouldUpload && HTTPUpload::SendMultipartPostRequest(L"https://crash-ingress.fivem.net/post", parameters, files, &timeout, &responseBody, &responseCode))
 #else
 		if (false)
 #endif
@@ -1566,7 +1624,13 @@ bool InitializeExceptionHandler()
 			CloseHandle(processInfo.hThread);
 		}
 
-		DWORD waitResult = WaitForSingleObject(initEvent, 7500);
+		DWORD waitResult = WaitForSingleObject(initEvent, 
+#ifdef _DEBUG
+			1500
+#else
+			7500
+#endif
+		);
 
 		if (!isDebugged)
 		{

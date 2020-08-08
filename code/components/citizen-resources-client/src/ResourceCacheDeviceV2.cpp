@@ -18,12 +18,14 @@
 #include <ICoreGameInit.h>
 #include <StreamingEvents.h>
 
-#include <SHA1.h>
+#include <openssl/sha.h>
 
 #include <VFSError.h>
 
 #include <pplawait.h>
 #include <experimental/resumable>
+
+#include <concurrent_queue.h>
 
 #include <CoreConsole.h>
 #include <Error.h>
@@ -39,13 +41,32 @@ size_t RcdBaseStream::GetLength()
 	return m_fetcher->GetLength(m_fileName);
 }
 
-bool RcdBaseStream::EnsureRead()
+bool RcdBaseStream::EnsureRead(const std::function<void(bool, const std::string&)>& cb)
 {
 	if (!m_parentDevice.GetRef() || m_parentHandle == INVALID_DEVICE_HANDLE)
 	{
 		try
 		{
 			auto task = m_fetcher->FetchEntry(m_fileName);
+
+			if (cb)
+			{
+				task.then([this, cb](concurrency::task<RcdFetchResult> task)
+				{
+					try
+					{
+						task.get();
+
+						cb(true, {});
+					}
+					catch (const std::exception& e)
+					{
+						m_fetcher->PropagateError(e.what());
+
+						cb(false, e.what());
+					}
+				});
+			}
 
 			if (m_fetcher->IsBlocking())
 			{
@@ -285,7 +306,11 @@ concurrency::task<RcdFetchResult> ResourceCacheDeviceV2::FetchEntry(const std::s
 
 	if (it == ms_entries.end() || !it->second)
 	{
+		lock.unlock();
+
 		auto retTask = concurrency::create_task(std::bind(&ResourceCacheDeviceV2::DoFetch, this, *entry));
+
+		lock.lock();
 
 		if (it != ms_entries.end())
 		{
@@ -349,11 +374,11 @@ concurrency::task<RcdFetchResult> ResourceCacheDeviceV2::DoFetch(const ResourceC
 			if (localStream.GetRef())
 			{
 				std::array<uint8_t, 8192> data;
-				sha1nfo sha1;
+				SHA_CTX sha1;
 				size_t numRead;
 
 				// initialize context
-				sha1_init(&sha1);
+				SHA1_Init(&sha1);
 
 				// read from the stream
 				while ((numRead = localStream->Read(data.data(), data.size())) > 0)
@@ -363,11 +388,12 @@ concurrency::task<RcdFetchResult> ResourceCacheDeviceV2::DoFetch(const ResourceC
 						break;
 					}
 
-					sha1_write(&sha1, reinterpret_cast<char*>(&data[0]), numRead);
+					SHA1_Update(&sha1, reinterpret_cast<char*>(&data[0]), numRead);
 				}
 
 				// get the hash result and convert it to a string
-				uint8_t* hash = sha1_result(&sha1);
+				uint8_t hash[20];
+				SHA1_Final(hash, &sha1);
 
 				auto hashString = fmt::sprintf("%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
 					hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7], hash[8], hash[9],
@@ -552,6 +578,56 @@ struct GetRcdDebugInfoExtension
 	std::string outData; // out
 };
 
+#define VFS_RCD_REQUEST_HANDLE 0x30003
+
+struct RequestHandleExtension
+{
+	vfs::Device::THandle handle;
+	std::function<void(bool success, const std::string& error)> onRead;
+};
+
+struct tp_work
+{
+	explicit tp_work(std::function<void()>&& cb)
+	{
+		auto data = new work_data(std::move(cb));
+		work = CreateThreadpoolWork(handle_work, data, NULL);
+	}
+
+	tp_work(const tp_work&) = delete;
+
+	void post()
+	{
+		SubmitThreadpoolWork(work);
+	}
+
+private:
+	static VOID CALLBACK handle_work(
+	_Inout_ PTP_CALLBACK_INSTANCE Instance,
+	_Inout_opt_ PVOID Context,
+	_Inout_ PTP_WORK Work)
+	{
+		work_data* wd = (work_data*)Context;
+		wd->cb();
+
+		delete wd;
+		CloseThreadpoolWork(Work);
+	}
+
+	struct work_data
+	{
+		explicit work_data(std::function<void()>&& cb)
+			: cb(std::move(cb))
+		{
+			
+		}
+
+		std::function<void()> cb;
+	};
+
+	PTP_WORK work;
+};
+
 bool ResourceCacheDeviceV2::ExtensionCtl(int controlIdx, void* controlData, size_t controlSize)
 {
 	if (controlIdx == VFS_GET_RAGE_PAGE_FLAGS)
@@ -569,6 +645,57 @@ bool ResourceCacheDeviceV2::ExtensionCtl(int controlIdx, void* controlData, size
 			data->flags.flag2 = strtoul(extData["rscPagesPhysical"].c_str(), nullptr, 10);
 			return true;
 		}
+	}
+	else if (controlIdx == VFS_RCD_REQUEST_HANDLE)
+	{
+		struct HandleContainer
+		{
+			explicit HandleContainer(ResourceCacheDeviceV2* self, vfs::Device::THandle hdl)
+				: self(self), hdl(hdl)
+			{
+				
+			}
+
+			~HandleContainer()
+			{
+				self->m_handleDeleteQueue.push(hdl);
+			}
+
+			ResourceCacheDeviceV2* self;
+			vfs::Device::THandle hdl;
+		};
+
+		{
+			THandle hdl;
+
+			while (m_handleDeleteQueue.try_pop(hdl))
+			{
+				CloseBulk(hdl);
+			}
+		}
+
+		RequestHandleExtension* data = (RequestHandleExtension*)controlData;
+
+		auto handle = std::make_shared<HandleContainer>(this, data->handle);
+		auto hd = GetHandle(handle->hdl);
+		auto cb = data->onRead;
+
+		tp_work work{ [this, handle, hd, cb]()
+			{
+				try
+				{
+					hd->bulkStream->EnsureRead([this, handle, cb](bool success, const std::string& error)
+					{
+						cb(success, error);
+					});
+				}
+				catch (const resources::RcdFetchFailedException& e)
+				{
+					cb(false, e.what());
+				}
+			} };
+
+		work.post();
 	}
 	else if (controlIdx == VFS_GET_DEVICE_LAST_ERROR)
 	{
@@ -599,11 +726,11 @@ bool ResourceCacheDeviceV2::ExtensionCtl(int controlIdx, void* controlData, size
 				if (localStream.GetRef())
 				{
 					std::array<uint8_t, 8192> data;
-					sha1nfo sha1;
+					SHA_CTX sha1;
 					size_t numRead;
 
 					// initialize context
-					sha1_init(&sha1);
+					SHA1_Init(&sha1);
 
 					// read from the stream
 					while ((numRead = localStream->Read(data.data(), data.size())) > 0)
@@ -613,11 +740,12 @@ bool ResourceCacheDeviceV2::ExtensionCtl(int controlIdx, void* controlData, size
 							break;
 						}
 
-						sha1_write(&sha1, reinterpret_cast<char*>(&data[0]), numRead);
+						SHA1_Update(&sha1, reinterpret_cast<char*>(&data[0]), numRead);
 					}
 
 					// get the hash result and convert it to a string
-					uint8_t* hash = sha1_result(&sha1);
+					uint8_t hash[20];
+					SHA1_Final(hash, &sha1);
 
 					diskHash = fmt::sprintf("%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
 						hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7], hash[8], hash[9],

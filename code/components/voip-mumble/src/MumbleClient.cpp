@@ -164,7 +164,7 @@ void MumbleClient::Initialize()
 			{
 				std::lock_guard<std::recursive_mutex> l(m_clientMutex);
 
-				if (m_curManualChannel != m_lastManualChannel)
+				if (m_curManualChannel != m_lastManualChannel && !m_state.GetChannels().empty())
 				{
 					// check if the channel already exists
 					std::wstring wname = ToWide(m_curManualChannel);
@@ -458,24 +458,42 @@ void MumbleClient::SetClientVolumeOverrideByServerId(uint32_t serverId, float vo
 
 std::wstring MumbleClient::GetPlayerNameFromServerId(uint32_t serverId)
 {
-	for (auto& user : m_state.GetUsers())
+	std::wstring retName;
+
+	m_state.ForAllUsers([serverId, &retName](const std::shared_ptr<MumbleUser>& user)
 	{
-		if (user.second && user.second->GetServerId() == serverId)
+		if (!retName.empty())
 		{
-			return user.second->GetName();
-;		}
-	}
+			return;
+		}
+
+		if (user && user->GetServerId() == serverId)
+		{
+			retName = user->GetName();
+		}
+	});
+
+	return retName;
 }
 
 uint32_t MumbleClient::GetVoiceChannelFromServerId(uint32_t serverId)
 {
-	for (auto& user : m_state.GetUsers())
+	uint32_t retId = -1;
+
+	m_state.ForAllUsers([serverId, &retId](const std::shared_ptr<MumbleUser>& user)
 	{
-		if (user.second && user.second->GetServerId() == serverId)
+		if (retId != -1)
 		{
-			return user.second->GetChannelId();
-;		}
-	}
+			return;
+		}
+
+		if (user && user->GetServerId() == serverId)
+		{
+			retId = user->GetChannelId();
+		}
+	});
+
+	return retId;
 }
 
 void MumbleClient::GetTalkers(std::vector<std::string>* referenceIds)
@@ -635,7 +653,7 @@ void MumbleClient::HandleVoice(const uint8_t* data, size_t size)
 		for (size_t i = 0; i < thisPing; i++)
 		{
 			auto var = float(m_udpPings[i]) - m_udpPingAverage;
-			varianceCount += var;
+			varianceCount += (var * var);
 		}
 
 		m_udpPingVariance = varianceCount / (thisPing + 1);
@@ -700,15 +718,7 @@ void MumbleClient::HandleVoice(const uint8_t* data, size_t size)
 		pds >> pos[1];
 		pds >> pos[2];
 
-		if (m_positionHook)
-		{
-			auto newPos = m_positionHook(ToNarrow(user->GetName()));
-
-			if (newPos)
-			{
-				pos = *newPos;
-			}
-		}
+		m_positionUpdates.push({ sessionId, pos });
 
 		if (pds.left() >= 4)
 		{
@@ -717,11 +727,34 @@ void MumbleClient::HandleVoice(const uint8_t* data, size_t size)
 
 			this->GetOutput().HandleClientDistance(*user, distance);
 		}
-
-		this->GetOutput().HandleClientPosition(*user, pos.data());
 	}
+}
 
-	printf("\n");
+void MumbleClient::RunFrame()
+{
+	decltype(m_positionUpdates)::value_type update;
+
+	while (m_positionUpdates.try_pop(update))
+	{
+		auto [sessionId, pos] = update;
+
+		auto user = this->GetState().GetUser(uint32_t(sessionId));
+
+		if (user)
+		{
+			if (m_positionHook)
+			{
+				auto newPos = m_positionHook(ToNarrow(user->GetName()));
+
+				if (newPos)
+				{
+					pos = *newPos;
+				}
+			}
+
+			this->GetOutput().HandleClientPosition(*user, pos.data());
+		}
+	}
 }
 
 void MumbleClient::MarkConnected()
@@ -776,7 +809,7 @@ void MumbleClient::HandlePing(const MumbleProto::Ping& ping)
 		for (size_t i = 0; i < thisPing; i++)
 		{
 			auto var = float(m_tcpPings[i]) - m_tcpPingAverage;
-			varianceCount += var;
+			varianceCount += (var * var);
 		}
 
 		m_tcpPingVariance = varianceCount / (thisPing + 1);

@@ -43,12 +43,12 @@
 
 static fx::GameServer* g_gameServer;
 
-extern std::shared_ptr<ConVar<bool>> g_oneSyncVar;
-
 extern fwEvent<> OnEnetReceive;
 
 namespace fx
 {
+	extern bool IsOneSync();
+
 	GameServer::GameServer()
 		: m_residualTime(0), m_serverTime(msec().count()), m_nextHeartbeatTime(0), m_hasSettled(false)
 	{
@@ -107,6 +107,7 @@ namespace fx
 		m_masters[1] = instance->AddVariable<std::string>("sv_master2", ConVar_None, "");
 		m_masters[2] = instance->AddVariable<std::string>("sv_master3", ConVar_None, "");
 		m_listingIpOverride = instance->AddVariable<std::string>("sv_listingIpOverride", ConVar_None, "");
+		m_useAccurateSendsVar = instance->AddVariable<bool>("sv_useAccurateSends", ConVar_None, true);
 
 		// sv_forceIndirectListing will break listings if the proxy host can not be reached
 		m_forceIndirectListing = instance->AddVariable<bool>("sv_forceIndirectListing", ConVar_None, false);
@@ -296,6 +297,7 @@ namespace fx
 			struct NetPersistentData
 			{
 				UvHandleContainer<uv_timer_t> tickTimer;
+				UvHandleContainer<uv_timer_t> sendTimer;
 
 				std::shared_ptr<std::unique_ptr<UvHandleContainer<uv_async_t>>> callbackAsync;
 
@@ -309,6 +311,7 @@ namespace fx
 
 			// periodic timer for network ticks
 			auto frameTime = 1000 / 100;
+			auto sendTime = 1000 / 40;
 
 			auto mpd = netData.get();
 
@@ -319,8 +322,19 @@ namespace fx
 				.Add({ {"name", "svNetwork"} }, prometheus::Histogram::BucketBoundaries{
 					.005, .01, .025, .05, .075, .1, .25, .5, .75, 1, 2.5, 5, 7.5, 10
 					});
+
+			auto processSendList = [this]()
+			{
+				while (!m_netSendList.empty())
+				{
+					const auto& [peer, channel, buffer, type] = m_netSendList.front();
+					m_net->SendPacket(peer, channel, buffer, type);
+
+					m_netSendList.pop_front();
+				}
+			};
 			
-			auto tcb = UvPersistentCallback(&netData->tickTimer, [this, mpd](uv_timer_t*)
+			auto tcb = UvPersistentCallback(&netData->tickTimer, [this, mpd, processSendList](uv_timer_t*)
 			{
 				auto now = msec();
 				auto thisTime = now - mpd->lastTime;
@@ -334,13 +348,10 @@ namespace fx
 
 				OnNetworkTick();
 
-				// process send list in between
-				while (!m_netSendList.empty())
+				if (m_useAccurateSendsVar->GetValue())
 				{
-					const auto& [peer, channel, buffer, type] = m_netSendList.front();
-					m_net->SendPacket(peer, channel, buffer, type);
-
-					m_netSendList.pop_front();
+					// process send list in between
+					processSendList();
 				}
 
 				// process game push
@@ -352,6 +363,15 @@ namespace fx
 
 			uv_timer_init(loop, &netData->tickTimer);
 			uv_timer_start(&netData->tickTimer, tcb, frameTime, frameTime);
+
+			uv_timer_init(loop, &netData->sendTimer);
+			uv_timer_start(&netData->sendTimer, UvPersistentCallback(&netData->sendTimer, [this, processSendList](uv_timer_t*)
+			{
+				if (!m_useAccurateSendsVar->GetValue())
+				{
+					processSendList();
+				}
+			}), sendTime, sendTime);
 
 			// event handle for callback list evaluation
 
@@ -663,7 +683,7 @@ namespace fx
 
 					client->SetPeer(peerId, peer->GetAddress());
 
-					if (g_oneSyncVar->GetValue())
+					if (IsOneSync())
 					{
 						if (client->GetSlotId() == -1)
 						{
@@ -698,12 +718,12 @@ namespace fx
 						client->GetNetId(),
 						(host) ? host->GetNetId() : -1,
 						(host) ? host->GetNetBase() : -1,
-						(g_oneSyncVar->GetValue())
+						(IsOneSync())
 							? ((fx::IsBigMode())
 								? 128
 								: client->GetSlotId())
 							: -1,
-						(g_oneSyncVar->GetValue()) ? msec().count() : -1);
+						(IsOneSync()) ? msec().count() : -1);
 
 					outMsg.Write(outStr.c_str(), outStr.size());
 
@@ -718,7 +738,7 @@ namespace fx
 							m_clientRegistry->HandleConnectedClient(client, oldNetID);
 						});
 
-						if (g_oneSyncVar->GetValue())
+						if (IsOneSync())
 						{
 							m_instance->GetComponent<fx::ServerGameState>()->SendObjectIds(client, fx::IsBigMode() ? 4 : 64);
 						}
@@ -864,8 +884,9 @@ namespace fx
 				if (peer)
 				{
 					const auto& lm = client->GetData("lockdownMode");
+					const auto& lf = client->GetData("lastFrame");
 
-					if (!lm.has_value() || std::any_cast<bool>(lm) != lockdownMode)
+					if (!lm.has_value() || std::any_cast<bool>(lm) != lockdownMode || !lf.has_value() || (m_serverTime - std::any_cast<uint64_t>(lf)) > 1000)
 					{
 						net::Buffer outMsg;
 						outMsg.Write(HashRageString("msgFrame"));
@@ -875,6 +896,7 @@ namespace fx
 						client->SendPacket(0, outMsg, NetPacketType_Reliable);
 
 						client->SetData("lockdownMode", lockdownMode);
+						client->SetData("lastFrame", m_serverTime);
 					}
 				}
 
@@ -1354,7 +1376,7 @@ namespace fx
 		{
 			inline static void Handle(ServerInstanceBase* instance, const std::shared_ptr<fx::Client>& client, net::Buffer& packet)
 			{
-				if (g_oneSyncVar->GetValue())
+				if (IsOneSync())
 				{
 					return;
 				}

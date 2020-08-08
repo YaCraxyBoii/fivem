@@ -40,6 +40,10 @@ else
 		component 'rage-formats-x'
 	end
 	
+	if _OPTIONS['game'] == 'five' then
+		component 'fxdk-main'
+	end
+	
 	component 'conhost-v2'
 	component 'voip-mumble'
 
@@ -84,6 +88,7 @@ component 'citizen-level-loader-five'
 component 'citizen-resources-metadata-lua'
 component 'citizen-scripting-core'
 component 'citizen-scripting-lua'
+component 'citizen-scripting-lua54'
 component 'citizen-playernames-five'
 component 'scripting-gta'
 component 'gta-game-five'
